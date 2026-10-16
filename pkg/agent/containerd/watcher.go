@@ -1,8 +1,10 @@
 package containerd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -22,10 +24,38 @@ import (
 )
 
 type fileInfo struct {
-	Size    int64       `json:"size"`
-	ModTime metav1.Time `json:"modTime"`
-	Images  []string    `json:"images"`
-	seen    bool        // field is not serialized, and can be used to track if a file has been seen since the last restart
+	Size     int64       `json:"size"`
+	ModTime  metav1.Time `json:"modTime"`
+	Images   []string    `json:"images"`
+	Status   ItemPhase   `json:"status,omitempty"`
+	Attempts int         `json:"attempts,omitempty"`
+	Error    string      `json:"error,omitempty"`
+	seen     bool        // field is not serialized, and can be used to track if a file has been seen since the last restart
+}
+
+// phase returns the explicit import status of a cached file. Entries written by
+// older k3s releases have no status field; a non-empty image list implies the
+// file was imported successfully.
+func (f *fileInfo) phase() ItemPhase {
+	if f == nil {
+		return PhasePending
+	}
+	if f.Status != "" {
+		return f.Status
+	}
+	if len(f.Images) > 0 {
+		return PhaseSucceeded
+	}
+	return PhasePending
+}
+
+// importCache is the on-disk serialization of the image import state. The
+// versioned envelope was introduced with batch status tracking; unversioned
+// legacy files (a bare map of path to fileInfo) remain readable, see parseImportCache.
+type importCache struct {
+	Version   string              `json:"version"`
+	UpdatedAt time.Time           `json:"updatedAt,omitempty"`
+	Files     map[string]*fileInfo `json:"files"`
 }
 
 type watchqueue struct {
@@ -66,29 +96,38 @@ func isFileSupported(path string) bool {
 	return false
 }
 
+// newImageClients creates the containerd and CRI image service clients used to
+// import and pull images. The returned cleanup function closes both connections.
+func newImageClients(ctx context.Context, cfg *config.Node) (*containerd.Client, runtimeapi.ImageServiceClient, func(), error) {
+	// create the connections to not create every time when processing a event
+	client, err := Client(cfg.Containerd.Address)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	criConn, err := cri.Connection(ctx, cfg.Containerd.Address)
+	if err != nil {
+		client.Close()
+		return nil, nil, nil, err
+	}
+
+	return client, runtimeapi.NewImageServiceClient(criConn), func() {
+		criConn.Close()
+		client.Close()
+	}, nil
+}
+
 // runWorkerForImages connects to containerd and calls processNextEventForImages to process items from the workqueue.
 // This blocks until the workqueue is shut down.
 func (w *watchqueue) runWorkerForImages(ctx context.Context) {
-	// create the connections to not create every time when processing a event
-	client, err := Client(w.cfg.Containerd.Address)
+	client, imageClient, closeClients, err := newImageClients(ctx, w.cfg)
 	if err != nil {
 		logrus.Errorf("Failed to create containerd client: %v", err)
 		w.watcher.Close()
 		return
 	}
 
-	defer client.Close()
-
-	criConn, err := cri.Connection(ctx, w.cfg.Containerd.Address)
-	if err != nil {
-		logrus.Errorf("Failed to create CRI connection: %v", err)
-		w.watcher.Close()
-		return
-	}
-
-	defer criConn.Close()
-
-	imageClient := runtimeapi.NewImageServiceClient(criConn)
+	defer closeClients()
 
 	for w.processNextEventForImages(ctx, client, imageClient) {
 	}
@@ -162,24 +201,57 @@ func (w *watchqueue) processImageEvent(ctx context.Context, key string, client *
 		return nil
 	}
 
-	if lastFileState := w.filesCache[key]; lastFileState == nil || lastFileState.Images == nil || file.Size() != lastFileState.Size || file.ModTime().After(lastFileState.ModTime.Time) {
-		start := time.Now()
-		images, err := preloadFile(ctx, w.cfg, client, imageClient, key)
-		if err != nil {
-			return errors.WithMessagef(err, "failed to import %s", key)
+	lastFileState := w.filesCache[key]
+	if lastFileState == nil || lastFileState.Images == nil || file.Size() != lastFileState.Size || file.ModTime().After(lastFileState.ModTime.Time) {
+		// Validate the source up front; directories, special files, and empty
+		// archives get an explicit Invalid status instead of repeated failures.
+		validator := func(string) error {
+			if file.IsDir() {
+				return fmt.Errorf("%w: %s: is a directory", ErrInvalidInput, key)
+			}
+			if file.Mode()&os.ModeType != 0 {
+				return fmt.Errorf("%w: %s: not a regular file", ErrInvalidInput, key)
+			}
+			if file.Size() == 0 && !strings.HasSuffix(key, ".txt") {
+				return fmt.Errorf("%w: %s: empty archive", ErrInvalidInput, key)
+			}
+			return nil
 		}
-		logrus.Infof("Imported %d images from %s in %s", len(images), key, time.Since(start))
-		imageNames := make([]string, len(images))
-		for i, image := range images {
-			imageNames[i] = image.Name
+
+		result := RunBatch(ctx, []string{key}, BatchOptions{
+			Validator: validator,
+			Previous:  w.itemPrevious(key, lastFileState),
+			Worker:    w.importFileWorker(client, imageClient),
+		})
+		item := result.Items[key]
+
+		entry := &fileInfo{
+			Size:     file.Size(),
+			ModTime:  metav1.NewTime(file.ModTime()),
+			Status:   item.Phase,
+			Attempts: item.Attempts,
+			Error:    item.Reason,
+			seen:     true,
 		}
-		w.filesCache[key] = &fileInfo{
-			Size:    file.Size(),
-			ModTime: metav1.NewTime(file.ModTime()),
-			Images:  imageNames,
-			seen:    true,
+		if item.Phase == PhaseSucceeded {
+			entry.Images = item.Images
+		} else if lastFileState != nil {
+			// Preserve any previously imported image names on a failed retry.
+			entry.Images = lastFileState.Images
 		}
+		w.filesCache[key] = entry
 		defer w.syncCache()
+
+		switch item.Phase {
+		case PhaseInvalid:
+			logrus.Warnf("Skipping invalid image source %s: %s", key, item.Reason)
+			return nil
+		case PhaseCanceled:
+			logrus.Warnf("Canceled image import for %s: %s", key, item.Reason)
+			return nil
+		case PhaseFailed:
+			return fmt.Errorf("failed to import %s after %d attempt(s): %s", key, item.Attempts, item.Reason)
+		}
 	} else if lastFileState != nil && !lastFileState.seen {
 		// first time seeing this file this start, re-add pinned label since K3s clears all pins on startup
 		if err := labelImagesByName(ctx, client, lastFileState.Images, filepath.Base(key)); err != nil {
@@ -218,7 +290,12 @@ func (w *watchqueue) syncCache() {
 	}
 	defer f.Close()
 
-	b, err := json.Marshal(&w.filesCache)
+	cache := &importCache{
+		Version:   cacheVersionV2,
+		UpdatedAt: time.Now(),
+		Files:     w.filesCache,
+	}
+	b, err := json.Marshal(cache)
 	if err != nil {
 		logrus.Errorf("Failed to marshal image import fileinfo cache: %v", err)
 		return
@@ -229,7 +306,7 @@ func (w *watchqueue) syncCache() {
 	}
 }
 
-// loadCaache reads the fileinfo cache from disk.
+// loadCache reads the fileinfo cache from disk.
 // It is not an error if this file exists or is empty.
 func (w *watchqueue) loadCache() {
 	filePath := filepath.Join(w.cfg.Images, ".cache.json")
@@ -248,39 +325,276 @@ func (w *watchqueue) loadCache() {
 		return
 	}
 
-	// 0 byte file is fine, but don't try to load it - allows users to simply
-	// touch the file to enable it for use.
-	if len(b) == 0 {
+	cache, err := parseImportCache(b)
+	if err != nil {
+		logrus.Errorf("Failed to unmarshal image import fileinfo cache: %v", err)
 		return
 	}
-
-	if err := json.Unmarshal(b, &w.filesCache); err != nil {
-		logrus.Errorf("Failed to unmarshal image import fileinfo cache: %v", err)
-	}
+	w.filesCache = cache.Files
 }
 
-// importAndWatchImages starts the image watcher and workqueue.
-// This function block until the workqueue is empty, indicating that all images
-// that currently exist have been imported.
+// parseImportCache parses the versioned import cache. Empty input yields an
+// empty cache. An unversioned document is accepted as the legacy format, which
+// serialized a bare map of file path to fileInfo.
+func parseImportCache(b []byte) (*importCache, error) {
+	cache := &importCache{
+		Version: cacheVersionV2,
+		Files:   map[string]*fileInfo{},
+	}
+
+	// 0 byte file is fine, but don't try to load it - allows users to simply
+	// touch the file to enable it for use.
+	if len(bytes.TrimSpace(b)) == 0 {
+		return cache, nil
+	}
+
+	// Probe for the versioned envelope; legacy files have no "version" key.
+	probed := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &probed); err != nil {
+		return nil, err
+	}
+	if _, ok := probed["version"]; ok {
+		if err := json.Unmarshal(b, cache); err != nil {
+			return nil, err
+		}
+		if cache.Files == nil {
+			cache.Files = map[string]*fileInfo{}
+		}
+		if cache.Version == "" {
+			cache.Version = cacheVersionV2
+		}
+		return cache, nil
+	}
+
+	// Legacy unversioned format: a bare map of file path to fileInfo.
+	if err := json.Unmarshal(b, &cache.Files); err != nil {
+		return nil, err
+	}
+	return cache, nil
+}
+
+// importAndWatchImages starts the image watcher and imports everything already
+// present in the images directory as a single resumable batch. The filesystem
+// event worker is started afterwards, and this function returns once the
+// startup batch has reached a terminal phase (success, partial success, or
+// cancellation).
 func importAndWatchImages(ctx context.Context, cfg *config.Node) error {
 	w, err := watchImages(ctx, cfg)
 	if err != nil {
 		return err
 	}
 
-	// Add images dir to workqueue; if it exists and contains images
-	// they will be recursively listed and enqueued.
-	w.workqueue.Add(cfg.Images)
+	// Recursively list existing sources before starting the fs-event worker,
+	// so the startup batch is the only writer of the files cache.
+	paths := w.listImportFiles(cfg.Images)
+	if len(paths) > 0 {
+		client, imageClient, closeClients, err := newImageClients(ctx, cfg)
+		if err != nil {
+			w.watcher.Close()
+			return err
+		}
 
-	// wait for the workqueue to empty before returning
-	for w.workqueue.Len() > 0 {
-		time.Sleep(500 * time.Millisecond)
+		// Persist after every status transition so that an interrupted large
+		// batch can resume without re-importing completed files.
+		result := runImportBatch(ctx, cfg, client, imageClient, paths, w.previousBatch(), func(progress *BatchResult) {
+			w.applyBatchResult(progress)
+			w.syncCache()
+		})
+		closeClients()
+
+		w.applyBatchResult(result)
+		w.syncCache()
+		logBatchSummary(cfg.Images, result)
 	}
 
 	// prune unseen entries from last run once all existing files have been processed
 	w.pruneCache()
 
+	// Files created or changed after startup are handled by the fs-event worker.
+	go w.runWorkerForImages(ctx)
+
 	return nil
+}
+
+// runImportBatch imports the listed image sources through the batch engine.
+func runImportBatch(ctx context.Context, cfg *config.Node, client *containerd.Client, imageClient runtimeapi.ImageServiceClient, paths []string, previous *BatchResult, onProgress func(*BatchResult)) *BatchResult {
+	return RunBatch(ctx, paths, BatchOptions{
+		Validator:   validateImportFile,
+		Fingerprint: fileFingerprint,
+		Previous:    previous,
+		OnProgress:  onProgress,
+		Worker:      importFileWorker(cfg, client, imageClient),
+	})
+}
+
+// BatchImportFiles imports the listed image tarballs and image-list text files
+// into containerd as a single batch. Each source is validated before import;
+// transient failures are retried idempotently; the returned BatchResult reports
+// the explicit status of every source, including partial success and
+// cancellation. The optional previous result enables resume: sources completed
+// by an earlier run are skipped when unchanged.
+func BatchImportFiles(ctx context.Context, cfg *config.Node, client *containerd.Client, imageClient runtimeapi.ImageServiceClient, paths []string, previous *BatchResult) *BatchResult {
+	return runImportBatch(ctx, cfg, client, imageClient, paths, previous, nil)
+}
+
+// importFileWorker returns an idempotent batch worker that imports a single
+// image source through containerd and the CRI image service.
+func importFileWorker(cfg *config.Node, client *containerd.Client, imageClient runtimeapi.ImageServiceClient) ItemWorker {
+	return func(ctx context.Context, path string) ([]string, error) {
+		start := time.Now()
+		imported, err := preloadFile(ctx, cfg, client, imageClient, path)
+		if err != nil {
+			return nil, err
+		}
+		logrus.Infof("Imported %d images from %s in %s", len(imported), path, time.Since(start))
+		names := make([]string, len(imported))
+		for i, image := range imported {
+			names[i] = image.Name
+		}
+		return names, nil
+	}
+}
+
+// importFileWorker binds the import worker to the watchqueue configuration.
+func (w *watchqueue) importFileWorker(client *containerd.Client, imageClient runtimeapi.ImageServiceClient) ItemWorker {
+	return importFileWorker(w.cfg, client, imageClient)
+}
+
+// listImportFiles recursively enumerates supported import sources under root
+// and registers every traversed directory with the fsnotify watcher, as
+// fsnotify does not watch recursively. A missing root directory is not an
+// error; the watcher enqueues files once the directory is created.
+func (w *watchqueue) listImportFiles(root string) []string {
+	paths := []string{}
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if err := w.watcher.Add(path); err != nil {
+				logrus.Debugf("Failed to add image import watch for %s: %v", path, err)
+			}
+			return nil
+		}
+		if isFileSupported(path) {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	return paths
+}
+
+// cachedFingerprint returns the fingerprint of a cached file entry. It matches
+// fileFingerprint output for an unchanged file.
+func cachedFingerprint(info *fileInfo) string {
+	return fmt.Sprintf("%d:%d", info.Size, info.ModTime.UnixNano())
+}
+
+// previousBatch converts successfully imported cache entries into a previous
+// batch result used to resume an interrupted startup import.
+func (w *watchqueue) previousBatch() *BatchResult {
+	items := make(map[string]*ItemResult, len(w.filesCache))
+	for path, info := range w.filesCache {
+		if info.phase() != PhaseSucceeded {
+			continue
+		}
+		items[path] = &ItemResult{
+			Key:         path,
+			Fingerprint: cachedFingerprint(info),
+			Phase:       PhaseSucceeded,
+			Attempts:    info.Attempts,
+			Images:      info.Images,
+		}
+	}
+	return &BatchResult{
+		Version: cacheVersionV2,
+		Phase:   BatchSucceeded,
+		Items:   items,
+	}
+}
+
+// itemPrevious converts a single cached entry into a previous batch result, so
+// that event-driven retries carry over the attempt count and completed state.
+func (w *watchqueue) itemPrevious(key string, info *fileInfo) *BatchResult {
+	if info == nil {
+		return nil
+	}
+	phase := info.phase()
+	if phase != PhaseSucceeded && phase != PhaseFailed && phase != PhaseCanceled {
+		return nil
+	}
+	return &BatchResult{
+		Version: cacheVersionV2,
+		Items: map[string]*ItemResult{
+			key: {
+				Key:         key,
+				Fingerprint: cachedFingerprint(info),
+				Phase:       phase,
+				Attempts:    info.Attempts,
+				Images:      info.Images,
+			},
+		},
+	}
+}
+
+// applyBatchResult merges a batch result into the files cache. Entries for
+// files that no longer exist retain the previous stat information, and are
+// pruned later if they remain unseen.
+func (w *watchqueue) applyBatchResult(result *BatchResult) {
+	if result == nil {
+		return
+	}
+	for key, item := range result.Items {
+		entry := &fileInfo{
+			Status:   item.Phase,
+			Attempts: item.Attempts,
+			Error:    item.Reason,
+		}
+		if info, err := os.Stat(key); err == nil {
+			entry.Size = info.Size()
+			entry.ModTime = metav1.NewTime(info.ModTime())
+			entry.seen = true
+		} else if existing := w.filesCache[key]; existing != nil {
+			entry.Size = existing.Size
+			entry.ModTime = existing.ModTime
+			entry.seen = existing.seen
+		}
+
+		switch item.Phase {
+		case PhaseSucceeded, PhaseSkipped:
+			entry.Status = PhaseSucceeded
+			entry.Images = item.Images
+			if len(entry.Images) == 0 {
+				if existing := w.filesCache[key]; existing != nil {
+					entry.Images = existing.Images
+				}
+			}
+		case PhaseRunning, PhasePending:
+			// In-progress state is persisted only to mark interruption; it
+			// never shadows previously imported image names.
+			if existing := w.filesCache[key]; existing != nil {
+				entry.Images = existing.Images
+			}
+		}
+		w.filesCache[key] = entry
+	}
+}
+
+// logBatchSummary records the terminal status of a startup import batch.
+func logBatchSummary(imagesDir string, result *BatchResult) {
+	switch result.Phase {
+	case BatchSucceeded:
+		logrus.Infof("Image import batch from %s complete: %d imported, %d skipped",
+			imagesDir, result.Succeeded, result.Skipped)
+	case BatchPartial:
+		logrus.Warnf("Image import batch from %s partially complete: %d imported, %d failed, %d invalid, %d skipped",
+			imagesDir, result.Succeeded, result.Failed, result.Invalid, result.Skipped)
+	case BatchCanceled:
+		logrus.Warnf("Image import batch from %s canceled: %d imported, %d canceled, %d failed",
+			imagesDir, result.Succeeded, result.Canceled, result.Failed)
+	case BatchFailed, BatchInvalid:
+		logrus.Errorf("Image import batch from %s failed: %s", imagesDir, result.Reason)
+	}
 }
 
 // watchImages starts a watcher on the parent of the images dir, and a workqueue to process events
@@ -307,7 +621,8 @@ func watchImages(ctx context.Context, cfg *config.Node) (*watchqueue, error) {
 		w.watcher.Close()
 	}()
 
-	go w.runWorkerForImages(ctx)
+	// The image event worker is started by importAndWatchImages after the
+	// startup import batch completes, so cache state only has a single writer.
 
 	go func() {
 		for {

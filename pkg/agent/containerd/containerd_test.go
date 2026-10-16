@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/containerd/containerd/v2/core/images"
@@ -157,6 +158,15 @@ type fakeImageStore struct {
 
 func newFakeImageStore() *fakeImageStore {
 	return &fakeImageStore{records: map[string]images.Image{}}
+}
+
+// Get resolves an image from the seeded records; absent records are reported as
+// not found, matching the containerd image store.
+func (f *fakeImageStore) Get(_ context.Context, name string) (images.Image, error) {
+	if image, ok := f.records[name]; ok {
+		return image, nil
+	}
+	return images.Image{}, fmt.Errorf("%w: %s", errdefs.ErrNotFound, name)
 }
 
 func (f *fakeImageStore) hook(op string) {
