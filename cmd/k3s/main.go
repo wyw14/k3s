@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
+	"github.com/k3s-io/k3s/pkg/cli/dryrun"
 	"github.com/k3s-io/k3s/pkg/configfilearg"
 	"github.com/k3s-io/k3s/pkg/data"
 	"github.com/k3s-io/k3s/pkg/datadir"
@@ -59,6 +60,7 @@ func main() {
 		cmds.NewCRICTL(externalCLIAction("crictl", dataDir)),
 		cmds.NewCtrCommand(externalCLIAction("ctr", dataDir)),
 		cmds.NewCheckConfigCommand(externalCLIAction("check-config", dataDir)),
+		cmds.NewDryRunCommand(dryrun.Run),
 		cmds.NewTokenCommands(
 			tokenCommand,
 			tokenCommand,
