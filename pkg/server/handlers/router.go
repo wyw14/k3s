@@ -43,6 +43,7 @@ func NewHandler(ctx context.Context, control *config.Control, cfg *cmds.Server) 
 	authed.Handle(prefix+"/apiservers", APIServers(control))
 	authed.Handle(prefix+"/config", Config(control, cfg))
 	authed.Handle(prefix+"/readyz", Readyz(control))
+	authed.Handle(prefix+"/negotiate", Negotiation(control))
 
 	nodeAuthed := mux.NewRouter()
 	nodeAuthed.NotFoundHandler = authed
